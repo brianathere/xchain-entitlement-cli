@@ -10,35 +10,26 @@ import (
 
 var (
 	Omega = &Config{
-		Contracts: []common.Address{
-			common.HexToAddress("0x7c0422b31401C936172C897802CF0373B35B7698"),
-			common.HexToAddress("0xC87bb04477151743070B45A3426938128896AC5D"),
-		},
-		RPCEndpoint: "https://mainnet.base.org",
+		BaseRegistery: common.HexToAddress("0x7c0422b31401C936172C897802CF0373B35B7698"),
+		RPCEndpoint:   "https://mainnet.base.org",
 	}
 
 	Gamma = &Config{
-		Contracts: []common.Address{
-			common.HexToAddress(""),
-			common.HexToAddress(""),
-		},
-		RPCEndpoint: "https://sepolia.base.org",
+		BaseRegistery: common.HexToAddress(""),
+		RPCEndpoint:   "https://sepolia.base.org",
 	}
 
 	Alpha = &Config{
-		Contracts: []common.Address{
-			common.HexToAddress(""),
-			common.HexToAddress(""),
-		},
-		RPCEndpoint: "https://sepolia.base.org",
+		BaseRegistery: common.HexToAddress(""),
+		RPCEndpoint:   "https://sepolia.base.org",
 	}
 )
 
 type (
 	Config struct {
-		Contracts   []common.Address
-		RPCEndpoint string
-		BlockRange  struct {
+		BaseRegistery common.Address
+		RPCEndpoint   string
+		BlockRange    struct {
 			From *big.Int
 			To   *big.Int
 		}

@@ -6,6 +6,8 @@ import (
 	"slices"
 	"sort"
 
+	"unicode/utf8"
+
 	"github.com/acarl005/stripansi"
 	"github.com/bas-vk/xchain-entitlement-cli/entitlement/generated"
 	"github.com/ethereum/go-ethereum"
@@ -14,7 +16,6 @@ import (
 	"github.com/fatih/color"
 	"github.com/rodaine/table"
 	"github.com/spf13/cobra"
-	"unicode/utf8"
 )
 
 func Run(cmd *cobra.Command, args []string) {
@@ -85,10 +86,9 @@ func fetch(
 		logs, err := client.FilterLogs(ctx, ethereum.FilterQuery{
 			FromBlock: big.NewInt(i),
 			ToBlock:   big.NewInt(min(i+blockRangeSize, to.Int64())),
-			Addresses: cfg.Contracts,
+			Addresses: []common.Address{cfg.BaseRegistery}, // Define the slice with the single value
 			Topics: [][]common.Hash{{
 				EntitlementCheckRequestedID,
-				EntitlementCheckResultPostedID,
 			}},
 		})
 		if err != nil {
@@ -99,7 +99,7 @@ func fetch(
 			switch log.Topics[0] {
 			case EntitlementCheckRequestedID:
 				var req generated.IEntitlementCheckerEntitlementCheckRequested
-				err = checkerABI.UnpackIntoInterface(&req, "EntitlementCheckRequested", log.Data)
+				err := checkerABI.UnpackIntoInterface(&req, "EntitlementCheckRequested", log.Data)
 				if err != nil {
 					panic(err)
 				}
@@ -108,15 +108,34 @@ func fetch(
 					return req.SelectedNodes[i].Cmp(req.SelectedNodes[j]) < 0
 				})
 				requests = append(requests, req)
-			case EntitlementCheckResultPostedID:
-				var res generated.IEntitlementGatedEntitlementCheckResultPosted
-				err = gatedABI.UnpackIntoInterface(&res, "EntitlementCheckResultPosted", log.Data)
+
+				resultContract := req.ContractAddress
+				start := int64(log.BlockNumber + 1)
+				end := int64(log.BlockNumber + 10)
+
+				resultLogs, err := client.FilterLogs(ctx, ethereum.FilterQuery{
+					FromBlock: big.NewInt(start),
+					ToBlock:   big.NewInt(end),
+					Addresses: []common.Address{resultContract}, // Define the slice with the single value
+					Topics: [][]common.Hash{{
+						EntitlementCheckResultPostedID,
+					}},
+				})
+
 				if err != nil {
 					panic(err)
 				}
-				res.TransactionId = log.Topics[1]
-				res.Raw = log
-				results[res.TransactionId] = res
+
+				for _, resultLog := range resultLogs {
+					var res generated.IEntitlementGatedEntitlementCheckResultPosted
+					err := gatedABI.UnpackIntoInterface(&res, "EntitlementCheckResultPosted", resultLog.Data)
+					if err != nil {
+						panic(err)
+					}
+					res.TransactionId = resultLog.Topics[1]
+					res.Raw = resultLog
+					results[res.TransactionId] = res
+				}
 			}
 		}
 	}
