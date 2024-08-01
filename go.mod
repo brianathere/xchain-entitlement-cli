@@ -14,8 +14,8 @@ require (
 	github.com/BurntSushi/toml v1.4.0 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/bits-and-blooms/bitset v1.13.0 // indirect
-	github.com/btcsuite/btcd v0.0.0-20171128150713-2e60448ffcc6 // indirect
 	github.com/btcsuite/btcd/btcec/v2 v2.3.4 // indirect
+	github.com/btcsuite/btcd/chaincfg/chainhash v1.1.0 // indirect
 	github.com/consensys/bavard v0.1.13 // indirect
 	github.com/consensys/gnark-crypto v0.13.0 // indirect
 	github.com/crate-crypto/go-kzg-4844 v1.1.0 // indirect
