@@ -2,7 +2,10 @@ package entitlement
 
 import (
 	"context"
+	"encoding/hex"
+	"fmt"
 	"math/big"
+	"os"
 	"slices"
 	"sort"
 
@@ -12,6 +15,7 @@ import (
 	"github.com/bas-vk/xchain-entitlement-cli/entitlement/generated"
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/fatih/color"
 	"github.com/rodaine/table"
@@ -45,13 +49,31 @@ func Run(cmd *cobra.Command, args []string) {
 		txID := common.Hash(req.TransactionId)
 		res, ok := results[txID]
 		if !ok {
-			tbl.AddRow(txID, color.HiRedString("NO"), "-", req.Raw.TxHash, req.Raw.BlockNumber, req.SelectedNodes)
+			tbl.AddRow(txID, color.HiRedString("NO"), "-", req.Raw.TxHash, req.Raw.BlockNumber, formatNodes(req.SelectedNodes, nil))
 		} else {
-			tbl.AddRow(txID, color.HiGreenString("YES"), res.Result, req.Raw.TxHash, req.Raw.BlockNumber, req.SelectedNodes)
+			tbl.AddRow(txID, color.HiGreenString("YES"), res, req.Raw.TxHash, req.Raw.BlockNumber, formatNodes(req.SelectedNodes, res))
 		}
 	}
 
 	tbl.Print()
+}
+
+func formatNodes(selectedNodes, respondedNodes []common.Address) string {
+	respondedMap := make(map[common.Address]struct{})
+	for _, addr := range respondedNodes {
+		respondedMap[addr] = struct{}{}
+	}
+
+	var formattedNodes string
+	for _, addr := range selectedNodes {
+		if _, found := respondedMap[addr]; found {
+			formattedNodes += color.HiGreenString(addr.Hex()) + " "
+		} else {
+			formattedNodes += color.HiRedString(addr.Hex()) + " "
+		}
+	}
+
+	return formattedNodes
 }
 
 func fetch(
@@ -60,18 +82,19 @@ func fetch(
 	cfg *Config,
 ) (
 	[]generated.IEntitlementCheckerEntitlementCheckRequested,
-	map[common.Hash]generated.IEntitlementGatedEntitlementCheckResultPosted,
+	map[common.Hash][]common.Address,
 ) {
 	var (
-		from                           = cfg.BlockRange.From
-		to                             = cfg.BlockRange.To
-		checkerABI, _                  = generated.IEntitlementCheckerMetaData.GetAbi()
-		gatedABI, _                    = generated.IEntitlementGatedMetaData.GetAbi()
-		EntitlementCheckRequestedID    = checkerABI.Events["EntitlementCheckRequested"].ID
-		EntitlementCheckResultPostedID = gatedABI.Events["EntitlementCheckResultPosted"].ID
-		requests                       []generated.IEntitlementCheckerEntitlementCheckRequested
-		results                        = make(map[common.Hash]generated.IEntitlementGatedEntitlementCheckResultPosted)
-		blockRangeSize                 = int64(10 * 1024)
+		from                               = cfg.BlockRange.From
+		to                                 = cfg.BlockRange.To
+		checkerABI, _                      = generated.IEntitlementCheckerMetaData.GetAbi()
+		gatedABI, _                        = generated.IEntitlementGatedMetaData.GetAbi()
+		EntitlementCheckRequestedID        = checkerABI.Events["EntitlementCheckRequested"].ID
+		EntitlementCheckResultPostedID     = gatedABI.Methods["postEntitlementCheckResult"].ID
+		EntitlementCheckResultPostedInputs = gatedABI.Methods["postEntitlementCheckResult"].Inputs
+		requests                           []generated.IEntitlementCheckerEntitlementCheckRequested
+		results                            = make(map[common.Hash][]common.Address)
+		blockRangeSize                     = int64(10 * 1024)
 	)
 
 	if to == nil {
@@ -109,33 +132,50 @@ func fetch(
 				})
 				requests = append(requests, req)
 
+				reqTxId := common.BytesToHash(req.TransactionId[:])
+
+				fmt.Printf("requested checkers %v %v\n", reqTxId, req.SelectedNodes)
+
 				resultContract := req.ContractAddress
-				start := int64(log.BlockNumber + 1)
-				end := int64(log.BlockNumber + 10)
+				start := int64(log.BlockNumber)
+				end := int64(log.BlockNumber + 10) // 20 seconds
 
-				resultLogs, err := client.FilterLogs(ctx, ethereum.FilterQuery{
-					FromBlock: big.NewInt(start),
-					ToBlock:   big.NewInt(end),
-					Addresses: []common.Address{resultContract}, // Define the slice with the single value
-					Topics: [][]common.Hash{{
-						EntitlementCheckResultPostedID,
-					}},
-				})
-
-				if err != nil {
-					panic(err)
-				}
-
-				for _, resultLog := range resultLogs {
-					var res generated.IEntitlementGatedEntitlementCheckResultPosted
-					err := gatedABI.UnpackIntoInterface(&res, "EntitlementCheckResultPosted", resultLog.Data)
+				for blockNumber := start; blockNumber <= end; blockNumber++ {
+					block, err := client.BlockByNumber(ctx, big.NewInt(int64(blockNumber)))
 					if err != nil {
-						panic(err)
+						fmt.Printf("Failed to retrieve block: %v\n", err)
+						os.Exit(1)
 					}
-					res.TransactionId = resultLog.Topics[1]
-					res.Raw = resultLog
-					results[res.TransactionId] = res
+
+					for _, tx := range block.Transactions() {
+						if tx.To() != nil && *tx.To() == resultContract {
+							txData := tx.Data()
+							if len(txData) >= 4 {
+								txMethodID := hex.EncodeToString(txData[:4])
+								if txMethodID == hex.EncodeToString(EntitlementCheckResultPostedID) {
+
+									from, err := types.Sender(types.LatestSignerForChainID(tx.ChainId()), tx)
+									if err == nil {
+										parsedData, err := EntitlementCheckResultPostedInputs.Unpack(txData[4:])
+										if err != nil {
+											fmt.Printf("Failed to unpack data: %v\n", err)
+										}
+
+										entitlementCheckResult := parsedData[0].([32]byte)
+
+										transactionId := common.BytesToHash(entitlementCheckResult[:])
+
+										results[transactionId] = append(results[transactionId], from)
+
+									} else {
+										fmt.Printf("Failed to recover address: %v\n", err)
+									}
+								}
+							}
+						}
+					}
 				}
+				fmt.Printf("responding checkers %v\n", results[reqTxId])
 			}
 		}
 	}
