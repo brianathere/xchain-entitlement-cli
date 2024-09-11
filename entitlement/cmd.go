@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"math/big"
-	"os"
 	"slices"
 	"sort"
 	"strings"
+	"sync"
+	"unicode/utf8"
 
 	"github.com/acarl005/stripansi"
 	"github.com/bas-vk/xchain-entitlement-cli/entitlement/generated"
@@ -19,7 +21,6 @@ import (
 	"github.com/fatih/color"
 	"github.com/rodaine/table"
 	"github.com/spf13/cobra"
-	"unicode/utf8"
 )
 
 type EntitlementCheckVote struct {
@@ -29,8 +30,9 @@ type EntitlementCheckVote struct {
 }
 
 type EntitlementCheck struct {
-	Request generated.IEntitlementCheckerEntitlementCheckRequested
-	Votes   map[common.Address]*EntitlementCheckVote
+	BlockNumber int64
+	Request     generated.IEntitlementCheckerEntitlementCheckRequested
+	Votes       map[common.Address]*EntitlementCheckVote
 }
 
 func (check *EntitlementCheck) Processed() bool {
@@ -76,15 +78,262 @@ func Run(cmd *cobra.Command, args []string) {
 		cfg = config(cmd, args)
 	)
 
-	client, err := ethclient.DialContext(ctx, cfg.RPCEndpoint)
+	requests, err := fetchEntitlementRequests(ctx, cfg)
 	if err != nil {
-		panic(err)
+		log.Fatalf("Failed to fetch entitlement requests: %v", err)
 	}
-	defer client.Close()
 
-	requests := fetchEntitlementRequests(ctx, client, cfg)
-	results := fetchEntitlementResults(ctx, client, requests)
+	results, err := fetchEntitlementResults(ctx, cfg, requests)
+	if err != nil {
+		log.Fatalf("Failed to fetch entitlement results: %v", err)
+	}
 
+	printResults(results)
+}
+
+func fetchEntitlementRequests(ctx context.Context, cfg *Config) ([]*EntitlementCheck, error) {
+	var (
+		from                        = cfg.BlockRange.From
+		to                          = cfg.BlockRange.To
+		checkerABI, _               = generated.IEntitlementCheckerMetaData.GetAbi()
+		EntitlementCheckRequestedID = checkerABI.Events["EntitlementCheckRequested"].ID
+		blockRangeSize              = int64(1024)
+		numWorkers                  = 32
+		requestsChan                = make(chan *EntitlementCheck, 100)
+		errChan                     = make(chan error, numWorkers)
+		wg                          sync.WaitGroup
+	)
+
+	if to == nil {
+		client, err := ethclient.DialContext(ctx, cfg.RPCEndpoint)
+		if err != nil {
+			return nil, fmt.Errorf("failed to connect to Ethereum client: %w", err)
+		}
+		defer client.Close()
+
+		head, err := client.HeaderByNumber(ctx, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get latest block number: %w", err)
+		}
+		to = head.Number
+	}
+
+	worker := func(workerId int, blockStart, blockEnd int64) {
+		log.Printf("fetchEntitlementRequests start worker %v for %v to %v", workerId, blockStart, blockEnd)
+		defer wg.Done()
+
+		client, err := ethclient.DialContext(ctx, cfg.RPCEndpoint)
+		if err != nil {
+			errChan <- fmt.Errorf("failed to connect to Ethereum client: %w", err)
+			return
+		}
+		defer client.Close()
+
+		// Process the block range in chunks of 1024 blocks
+		for currentBlock := blockStart; currentBlock <= blockEnd; currentBlock += blockRangeSize {
+			chunkEnd := min(currentBlock+blockRangeSize-1, blockEnd) // Calculate the end of the current chunk
+
+			logs, err := client.FilterLogs(ctx, ethereum.FilterQuery{
+				FromBlock: big.NewInt(currentBlock),
+				ToBlock:   big.NewInt(chunkEnd),
+				Addresses: []common.Address{cfg.BaseRegistery},
+				Topics:    [][]common.Hash{{EntitlementCheckRequestedID}},
+			})
+			if err != nil {
+				errChan <- fmt.Errorf("error fetching logs for block range %d - %d: %w", currentBlock, chunkEnd, err)
+				return
+			}
+
+			// Process logs for the current chunk
+			for _, log := range logs {
+				if log.Topics[0] == EntitlementCheckRequestedID {
+					var req generated.IEntitlementCheckerEntitlementCheckRequested
+					err := checkerABI.UnpackIntoInterface(&req, "EntitlementCheckRequested", log.Data)
+					if err != nil {
+						errChan <- fmt.Errorf("error unpacking log data: %w", err)
+						continue
+					}
+					req.Raw = log
+
+					sort.Slice(req.SelectedNodes, func(i, j int) bool {
+						return req.SelectedNodes[i].Cmp(req.SelectedNodes[j]) < 0
+					})
+
+					requestsChan <- &EntitlementCheck{
+						BlockNumber: int64(log.BlockNumber),
+						Request:     req,
+						Votes:       make(map[common.Address]*EntitlementCheckVote),
+					}
+				}
+			}
+
+		}
+
+		log.Printf("fetchEntitlementRequests end worker %v for block range %v to %v", workerId, blockStart, blockEnd)
+	}
+
+	// Start the workers
+
+	totalBlocks := to.Int64() - from.Int64() + 1
+	blocksPerWorker := totalBlocks / int64(numWorkers)
+	extraBlocks := totalBlocks % int64(numWorkers)
+
+	startBlock := from.Int64()
+
+	for i := 0; i < numWorkers; i++ {
+		endBlock := startBlock + blocksPerWorker - 1
+		if int64(i) < extraBlocks {
+			endBlock++
+		}
+
+		wg.Add(1)
+		go worker(i, startBlock, endBlock)
+		startBlock = endBlock + 1
+
+	}
+
+	go func() {
+		wg.Wait()
+		close(requestsChan)
+		close(errChan)
+	}()
+
+	var requests []*EntitlementCheck
+	for req := range requestsChan {
+		requests = append(requests, req)
+	}
+
+	for err := range errChan {
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	slices.Reverse(requests)
+	return requests, nil
+}
+
+// EntitlementCheck and other relevant structures would be defined earlier in your code.
+
+func fetchEntitlementResults(ctx context.Context, cfg *Config, requests []*EntitlementCheck) ([]*EntitlementCheck, error) {
+	var (
+		gatedABI, _                        = generated.IEntitlementGatedMetaData.GetAbi()
+		EntitlementCheckResultPostedID     = gatedABI.Methods["postEntitlementCheckResult"].ID
+		postFuncSelector                   = hex.EncodeToString(EntitlementCheckResultPostedID[:4])
+		EntitlementCheckResultPostedInputs = gatedABI.Methods["postEntitlementCheckResult"].Inputs
+		numWorkers                         = 32
+		wg                                 sync.WaitGroup
+		blockCache                         = make(map[int64]*types.Block)
+		cacheLock                          sync.RWMutex
+	)
+
+	log.Printf("fetchEntitlementResults for %v requests", len(requests))
+
+	// Channel to distribute work to workers
+	requestChan := make(chan *EntitlementCheck)
+
+	// Worker function
+	worker := func(workerID int) {
+		client, err := ethclient.DialContext(ctx, cfg.RPCEndpoint)
+		if err != nil {
+			log.Printf("ethclient.DialContext failed %v\n", err)
+			return
+		}
+		defer client.Close()
+
+		defer wg.Done()
+		for req := range requestChan {
+			log.Printf("Worker %d processing request %v", workerID, req.Request.TransactionId)
+			resultContract := req.Request.ContractAddress
+
+			for blockNumber := req.BlockNumber; blockNumber <= req.BlockNumber+30; blockNumber++ {
+				// Check the block cache
+				cacheLock.RLock()
+				block, found := blockCache[blockNumber]
+				cacheLock.RUnlock()
+
+				if !found {
+					// Fetch the block if it's not in the cache
+					var err error
+					block, err = client.BlockByNumber(ctx, big.NewInt(blockNumber))
+					if err != nil {
+						log.Printf("Worker %d failed to retrieve block %d: %v", workerID, blockNumber, err)
+						continue
+					}
+
+					// Store the block in the cache
+					cacheLock.Lock()
+					blockCache[blockNumber] = block
+					cacheLock.Unlock()
+				}
+
+				// Process the block transactions
+				for _, tx := range block.Transactions() {
+					if tx.To() != nil && *tx.To() == resultContract {
+						txData := tx.Data()
+						if len(txData) >= 4 {
+							txFuncSelector := hex.EncodeToString(txData[:4])
+							if txFuncSelector == postFuncSelector {
+								from, err := types.Sender(types.LatestSignerForChainID(tx.ChainId()), tx)
+								if err != nil {
+									log.Printf("Worker %d failed to recover address: %v", workerID, err)
+									continue
+								}
+
+								parsedData, err := EntitlementCheckResultPostedInputs.Unpack(txData[4:])
+								if err != nil {
+									log.Printf("Worker %d failed to unpack data: %v", workerID, err)
+									continue
+								}
+
+								entitlementCheckResult := parsedData[0].([32]byte)
+								transactionId := common.BytesToHash(entitlementCheckResult[:])
+
+								// Update the entitlement check votes
+								if transactionId == req.Request.TransactionId {
+									if vote, alreadyVoted := req.Votes[from]; alreadyVoted {
+										vote.Count++
+									} else {
+										req.Votes[from] = &EntitlementCheckVote{
+											RoleID: parsedData[1].(*big.Int),
+											Result: parsedData[2].(uint8),
+											Count:  1,
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+
+				// Break out if we have all the votes
+				if len(req.Request.SelectedNodes) == len(req.Votes) {
+					break
+				}
+			}
+		}
+	}
+
+	// Start 32 worker goroutines
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go worker(i)
+	}
+
+	for _, req := range requests {
+		requestChan <- req
+	}
+
+	close(requestChan)
+
+	// Wait for all workers to finish
+	wg.Wait()
+
+	return requests, nil
+}
+
+func printResults(results []*EntitlementCheck) {
+	log.Printf("printResults for %v tx", len(results))
 	headerFmt := color.New(color.FgGreen, color.Underline).SprintfFunc()
 	columnFmt := color.New(color.FgYellow).SprintfFunc()
 	colorAwareWidthFunc := func(s string) int { return utf8.RuneCountInString(stripansi.Strip(s)) }
@@ -112,123 +361,9 @@ func Run(cmd *cobra.Command, args []string) {
 	tbl.Print()
 }
 
-func fetchEntitlementRequests(ctx context.Context, client *ethclient.Client, cfg *Config) []*EntitlementCheck {
-	var (
-		from                        = cfg.BlockRange.From
-		to                          = cfg.BlockRange.To
-		checkerABI, _               = generated.IEntitlementCheckerMetaData.GetAbi()
-		EntitlementCheckRequestedID = checkerABI.Events["EntitlementCheckRequested"].ID
-		requests                    []*EntitlementCheck
-		blockRangeSize              = int64(10 * 1024)
-	)
-
-	if to == nil {
-		head, err := client.HeaderByNumber(ctx, nil)
-		if err != nil {
-			panic(err)
-		}
-		to = head.Number
+func min(a, b int64) int64 {
+	if a < b {
+		return a
 	}
-
-	for i := from.Int64(); i < to.Int64(); i += blockRangeSize {
-		logs, err := client.FilterLogs(ctx, ethereum.FilterQuery{
-			FromBlock: big.NewInt(i),
-			ToBlock:   big.NewInt(min(i+blockRangeSize, to.Int64())),
-			Addresses: []common.Address{cfg.BaseRegistery}, // Define the slice with the single value
-			Topics: [][]common.Hash{{
-				EntitlementCheckRequestedID,
-			}},
-		})
-		if err != nil {
-			panic(err)
-		}
-
-		for _, log := range logs {
-			switch log.Topics[0] {
-			case EntitlementCheckRequestedID:
-				var req generated.IEntitlementCheckerEntitlementCheckRequested
-				err := checkerABI.UnpackIntoInterface(&req, "EntitlementCheckRequested", log.Data)
-				if err != nil {
-					panic(err)
-				}
-				req.Raw = log
-
-				sort.Slice(req.SelectedNodes, func(i, j int) bool {
-					return req.SelectedNodes[i].Cmp(req.SelectedNodes[j]) < 0
-				})
-
-				requests = append(requests, &EntitlementCheck{
-					Request: req,
-					Votes:   make(map[common.Address]*EntitlementCheckVote),
-				})
-
-			}
-		}
-	}
-
-	// most recent entitlement check requests first
-	slices.Reverse(requests)
-
-	return requests
-}
-
-func fetchEntitlementResults(ctx context.Context, client *ethclient.Client, requests []*EntitlementCheck) []*EntitlementCheck {
-	var (
-		gatedABI, _                        = generated.IEntitlementGatedMetaData.GetAbi()
-		EntitlementCheckResultPostedID     = gatedABI.Methods["postEntitlementCheckResult"].ID
-		postFuncSelector                   = hex.EncodeToString(EntitlementCheckResultPostedID[:4])
-		EntitlementCheckResultPostedInputs = gatedABI.Methods["postEntitlementCheckResult"].Inputs
-	)
-
-	for _, req := range requests {
-		start := int64(req.Request.Raw.BlockNumber)
-		end := int64(req.Request.Raw.BlockNumber + 10) // 20 seconds
-
-		for blockNumber := start; blockNumber <= end; blockNumber++ {
-			block, err := client.BlockByNumber(ctx, big.NewInt(blockNumber))
-			if err != nil {
-				fmt.Printf("Failed to retrieve block: %v\n", err)
-				os.Exit(1)
-			}
-
-			resultContract := req.Request.ContractAddress
-
-			for _, tx := range block.Transactions() {
-				if tx.To() != nil && *tx.To() == resultContract {
-					txData := tx.Data()
-					if len(txData) >= 4 {
-						txFuncSelector := hex.EncodeToString(txData[:4])
-						if txFuncSelector == postFuncSelector {
-							from, err := types.Sender(types.LatestSignerForChainID(tx.ChainId()), tx)
-							if err == nil {
-								parsedData, err := EntitlementCheckResultPostedInputs.Unpack(txData[4:])
-								if err != nil {
-									fmt.Printf("Failed to unpack data: %v\n", err)
-								}
-
-								entitlementCheckResult := parsedData[0].([32]byte)
-								transactionId := common.BytesToHash(entitlementCheckResult[:])
-
-								if transactionId == req.Request.TransactionId {
-									if vote, alreadyVoted := req.Votes[from]; alreadyVoted {
-										vote.Count++
-									} else {
-										req.Votes[from] = &EntitlementCheckVote{
-											RoleID: parsedData[1].(*big.Int),
-											Result: parsedData[2].(uint8),
-											Count:  1,
-										}
-									}
-								}
-							} else {
-								fmt.Printf("Failed to recover address: %v\n", err)
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-
-	return requests
+	return b
 }

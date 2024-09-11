@@ -11,16 +11,16 @@ import (
 var (
 	Omega = &Config{
 		BaseRegistery: common.HexToAddress("0x7c0422b31401C936172C897802CF0373B35B7698"),
-		RPCEndpoint:   "https://mainnet.base.org",
+		RPCEndpoint:   "https://base-mainnet.g.alchemy.com/v2/_2IJgK5L8s_gn5CJiY91zDxoWCqq_cXd",
 	}
 
 	Gamma = &Config{
-		BaseRegistery: common.HexToAddress(""),
+		BaseRegistery: common.HexToAddress("0x08cC41b782F27d62995056a4EF2fCBAe0d3c266F"),
 		RPCEndpoint:   "https://sepolia.base.org",
 	}
 
 	Alpha = &Config{
-		BaseRegistery: common.HexToAddress(""),
+		BaseRegistery: common.HexToAddress("0x0230a9d28bc48a90d6f5e5112b24319ec1b14c52"),
 		RPCEndpoint:   "https://sepolia.base.org",
 	}
 )
@@ -67,7 +67,6 @@ func config(cmd *cobra.Command, args []string) *Config {
 		Omega.BlockRange.To = to
 		return Omega
 	case "gamma":
-		panic("missing contract addresses for gamma")
 		if customRpcProvider != "" {
 			Gamma.RPCEndpoint = customRpcProvider
 		}
@@ -75,7 +74,6 @@ func config(cmd *cobra.Command, args []string) *Config {
 		Gamma.BlockRange.To = to
 		return Gamma
 	case "alpha":
-		panic("missing contract addresses for alpha")
 		if customRpcProvider != "" {
 			Alpha.RPCEndpoint = customRpcProvider
 		}
